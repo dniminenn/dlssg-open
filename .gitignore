@@ -1,0 +1,12 @@
+build/
+logs/
+out/
+out2/
+nvcuda/
+dxvk-nvapi/
+*.log
+*.dll
+*.bin
+*.cubin
+*.ptx
+__pycache__/

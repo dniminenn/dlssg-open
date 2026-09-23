@@ -1,0 +1,422 @@
+diff --git a/src/nvapi/nvapi_d3d12_device.cpp b/src/nvapi/nvapi_d3d12_device.cpp
+index 761590e..5bf4126 100644
+--- a/src/nvapi/nvapi_d3d12_device.cpp
++++ b/src/nvapi/nvapi_d3d12_device.cpp
+@@ -1,5 +1,15 @@
++#include <string>
++#include <atomic>
++#include <cstdio>
++#include <optional>
++#include <cstring>
++#include <algorithm>
+ #include "nvapi_d3d12_device.h"
+ #include "../util/util_log.h"
++#include "../util/util_env.h"
++#include "../util/util_string.h"
++#include <mutex>
++#include <unordered_map>
+ 
+ namespace dxvk {
+     std::atomic<LONGLONG> NvapiD3d12Device::m_resetTimestamp;
+@@ -111,6 +121,254 @@ namespace dxvk {
+             m_supportsNvShaderExtn = true;
+     }
+ 
++
++    // ---- dlssg-open: CUDA fatbin PTX retargeting -------------------------------------------------
++    // NVIDIA's DLSS-G runtime ships kernels as fatbins holding ELF sm_89 + LZ4 PTX ".target sm_89".
++    // The driver refuses PTX targeting a higher SM than the device.  When DXVK_NVAPI_CUBIN_RETARGET_SM
++    // (e.g. "86") is set the fatbin is copied and the ".target sm_NN" literal inside each PTX entry
++    // is rewritten (its first occurrence is a literal in the LZ4 stream), plus the entry's arch field.
++    // The driver then skips the incompatible ELF and JIT-compiles the retargeted PTX.
++    static int retargetSm() {
++        static int sm = [] {
++            auto v = env::getEnvVariable("DXVK_NVAPI_CUBIN_RETARGET_SM");
++            return v.empty() ? 0 : std::atoi(v.c_str());
++        }();
++        return sm;
++    }
++
++
++    // dlssg-open: DXVK_NVAPI_CUBIN_DUMP_DIR=<dir> writes every uploaded cubin/fatbin to disk for analysis.
++    static void dumpCubin(const void* data, uint32_t size, const char* name) {
++        static const std::string dir = env::getEnvVariable("DXVK_NVAPI_CUBIN_DUMP_DIR");
++        if (dir.empty() || !data || !size) return;
++        static std::atomic<int> seq{0};
++        int n = seq++;
++        std::string fname = dir + "\\" + std::to_string(n) + "_" + (name ? name : "noname") + ".bin";
++        FILE* f = std::fopen(fname.c_str(), "wb");
++        if (!f) return;
++        std::fwrite(data, 1, size, f);
++        std::fclose(f);
++    }
++
++    static std::mutex g_retargetMutex;
++    static std::unordered_map<NVDX_ObjectHandle, std::vector<uint8_t>> g_retargetedCubins;
++
++    void NvapiD3d12Device::KeepRetargeted(NVDX_ObjectHandle handle, std::vector<uint8_t>&& buf) {
++        std::scoped_lock lock(g_retargetMutex);
++        g_retargetedCubins.emplace(handle, std::move(buf));
++    }
++
++    void NvapiD3d12Device::DropRetargeted(NVDX_ObjectHandle handle) {
++        std::scoped_lock lock(g_retargetMutex);
++        g_retargetedCubins.erase(handle);
++    }
++
++    std::optional<std::vector<uint8_t>> NvapiD3d12Device::RetargetFatbin(const void* data, uint32_t size) {
++        auto sm = retargetSm();
++        if (sm < 10 || sm > 99 || !data || size < 16)
++            return std::nullopt;
++
++        auto src = static_cast<const uint8_t*>(data);
++        uint32_t magic; std::memcpy(&magic, src, 4);
++        uint16_t ver; std::memcpy(&ver, src + 4, 2);
++        uint16_t hdr; std::memcpy(&hdr, src + 6, 2);
++        if (magic != 0xBA55ED50u || ver != 1 || hdr != 16) {
++            log::info(str::format("Cubin upload: not a fatbin (magic ", magic, ", size ", size, ")"));
++            return std::nullopt;
++        }
++        {
++            std::string desc;
++            size_t q = hdr;
++            while (q + 64 <= size) {
++                uint16_t k; std::memcpy(&k, src + q, 2);
++                uint32_t hs; std::memcpy(&hs, src + q + 4, 4);
++                uint64_t pd; std::memcpy(&pd, src + q + 8, 8);
++                uint32_t ar; std::memcpy(&ar, src + q + 28, 4);
++                if ((k != 1 && k != 2) || hs < 64 || q + hs + pd > size) break;
++                desc += (k == 1 ? " ptx" : " elf") + std::string("_sm") + std::to_string(ar);
++                q += hs + pd;
++            }
++            log::info(str::format("Cubin upload: fatbin size ", size, " entries:", desc));
++        }
++
++        std::vector<uint8_t> buf(src, src + size);
++        char want[16]; std::snprintf(want, sizeof(want), ".target sm_%d", sm);
++        const std::string wantStr(want);
++        bool changed = false;
++        size_t p = hdr;
++        while (p + 64 <= buf.size()) {
++            uint16_t kind; std::memcpy(&kind, &buf[p], 2);
++            uint32_t hsz; std::memcpy(&hsz, &buf[p + 4], 4);
++            uint64_t padded; std::memcpy(&padded, &buf[p + 8], 8);
++            uint32_t real; std::memcpy(&real, &buf[p + 16], 4);
++            uint32_t arch; std::memcpy(&arch, &buf[p + 28], 4);
++            if ((kind != 1 && kind != 2) || hsz < 64 || p + hsz + padded > buf.size())
++                break;
++            if (kind == 1 && arch > static_cast<uint32_t>(sm) && arch < 100) {
++                auto begin = buf.begin() + p + hsz;
++                auto end = begin + std::min<uint64_t>(real, padded);
++                const std::string needle = ".target sm_" + std::to_string(arch);
++                auto it = std::search(begin, end, needle.begin(), needle.end());
++                if (it != end) {
++                    std::copy(wantStr.begin(), wantStr.end(), it);
++                    uint32_t a = sm; std::memcpy(&buf[p + 28], &a, 4);
++                    changed = true;
++                    log::info(str::format("Retargeted fatbin PTX entry sm_", arch, " -> sm_", sm));
++                } else {
++                    log::info(str::format("Fatbin PTX entry sm_", arch, ": '.target' literal not found, left untouched"));
++                }
++            }
++            p += hsz + padded;
++        }
++        if (!changed)
++            return std::nullopt;
++        return buf;
++    }
++
++
++    // ---- dlssg-open: raw ELF cubin substitution --------------------------------------------------
++    // The DLSS-G 310.x runtime uploads its neural-network kernels as bare ELF cubins (SASS only) and
++    // picks the sm_89 build because NVAPI reports Ada.  The same DLL embeds an sm_86 build of every
++    // one of those kernels.  When a bare cubin arrives whose SM is above DXVK_NVAPI_CUBIN_RETARGET_SM,
++    // the runtime DLL is read from disk, its sm_<target> cubins indexed, the twin chosen (same kernel
++    // name, same .text size, same constant banks, highest per-instruction equality), the
++    // runtime's .nv.shared size copied onto it, and the twin handed to the driver instead.
++    namespace elf {
++        struct Cubin {
++            std::vector<uint8_t> data;
++            uint32_t sm = 0;
++            std::string kernel;
++            size_t textOff = 0, textSize = 0;
++            std::vector<uint8_t> c2;
++            size_t c0Size = 0;
++            int sharedShdr = -1;   // index of .nv.shared.<k> section header
++            int rwPhdr = -1;       // index of RW PT_LOAD
++        };
++
++        static bool parse(const uint8_t* d, size_t n, Cubin& out) {
++            if (n < 64 || std::memcmp(d, "\x7f" "ELF", 4) != 0 || d[4] != 2) return false;
++            uint16_t machine; std::memcpy(&machine, d + 18, 2);
++            if (machine != 190) return false;
++            uint32_t flags; std::memcpy(&flags, d + 48, 4);
++            uint64_t phoff, shoff; std::memcpy(&phoff, d + 32, 8); std::memcpy(&shoff, d + 40, 8);
++            uint16_t phentsize, phnum, shentsize, shnum, shstrndx;
++            std::memcpy(&phentsize, d + 54, 2); std::memcpy(&phnum, d + 56, 2);
++            std::memcpy(&shentsize, d + 58, 2); std::memcpy(&shnum, d + 60, 2); std::memcpy(&shstrndx, d + 62, 2);
++            size_t end = std::max<size_t>(shoff + size_t(shentsize) * shnum, phoff + size_t(phentsize) * phnum);
++            if (end > n || shstrndx >= shnum || shentsize < 64) return false;
++            auto sh = [&](int i, int field) { uint64_t v; std::memcpy(&v, d + shoff + size_t(i) * shentsize + field, 8); return v; };
++            auto sh32 = [&](int i, int field) { uint32_t v; std::memcpy(&v, d + shoff + size_t(i) * shentsize + field, 4); return v; };
++            uint64_t strOff = sh(shstrndx, 24), strSize = sh(shstrndx, 32);
++            if (strOff + strSize > n) return false;
++            out.data.assign(d, d + end);
++            out.sm = flags & 0xff;
++            for (int i = 0; i < shnum; i++) {
++                uint32_t nameIdx = sh32(i, 0);
++                if (nameIdx >= strSize) continue;
++                std::string name(reinterpret_cast<const char*>(d + strOff + nameIdx));
++                uint64_t off = sh(i, 24), size = sh(i, 32);
++                if (name.rfind(".text.", 0) == 0 && out.kernel.empty()) { out.kernel = name.substr(6); out.textOff = off; out.textSize = size; }
++                else if (name.rfind(".nv.constant2.", 0) == 0 && off + size <= n) out.c2.assign(d + off, d + off + size);
++                else if (name.rfind(".nv.constant0.", 0) == 0) out.c0Size = size;
++                else if (name.rfind(".nv.shared.", 0) == 0) out.sharedShdr = i;
++            }
++            for (int i = 0; i < phnum; i++) {
++                uint32_t type, pflags; std::memcpy(&type, d + phoff + size_t(i) * phentsize, 4); std::memcpy(&pflags, d + phoff + size_t(i) * phentsize + 4, 4);
++                if (type == 1 && (pflags & 2) && !(pflags & 1)) out.rwPhdr = i;   // PT_LOAD, W, not X
++            }
++            return !out.kernel.empty() && out.textOff + out.textSize <= n;
++        }
++
++        static uint64_t sharedSize(const Cubin& c) {
++            if (c.sharedShdr < 0) return 0;
++            uint64_t shoff; std::memcpy(&shoff, c.data.data() + 40, 8);
++            uint16_t shentsize; std::memcpy(&shentsize, c.data.data() + 58, 2);
++            uint64_t v; std::memcpy(&v, c.data.data() + shoff + size_t(c.sharedShdr) * shentsize + 32, 8); return v;
++        }
++
++        static void setSharedSize(Cubin& c, uint64_t v) {
++            if (c.sharedShdr < 0) return;
++            uint64_t shoff; std::memcpy(&shoff, c.data.data() + 40, 8);
++            uint16_t shentsize; std::memcpy(&shentsize, c.data.data() + 58, 2);
++            std::memcpy(c.data.data() + shoff + size_t(c.sharedShdr) * shentsize + 32, &v, 8);
++            if (c.rwPhdr >= 0) {
++                uint64_t phoff; std::memcpy(&phoff, c.data.data() + 32, 8);
++                uint16_t phentsize; std::memcpy(&phentsize, c.data.data() + 54, 2);
++                std::memcpy(c.data.data() + phoff + size_t(c.rwPhdr) * phentsize + 40, &v, 8);   // p_memsz
++            }
++        }
++
++        static double score(const Cubin& a, const Cubin& b) {
++            if (a.textSize != b.textSize || a.textSize == 0) return 0.0;
++            size_t chunks = a.textSize / 16, eq = 0;
++            for (size_t i = 0; i < chunks; i++)
++                if (std::memcmp(a.data.data() + a.textOff + i * 16, b.data.data() + b.textOff + i * 16, 16) == 0) eq++;
++            return chunks ? double(eq) / double(chunks) : 0.0;
++        }
++    }
++
++    static std::mutex g_twinMutex;
++    static std::vector<elf::Cubin> g_twins;
++    static bool g_twinsLoaded = false;
++
++    static void loadTwins(int targetSm) {
++        std::scoped_lock lock(g_twinMutex);
++        if (g_twinsLoaded) return;
++        g_twinsLoaded = true;
++        const char* candidates[] = {"nvngx_dlssg.dll", "nvngx_dlss.dll"};
++        for (auto modName : candidates) {
++            HMODULE h = GetModuleHandleA(modName);
++            if (!h) continue;
++            char path[MAX_PATH];
++            if (!GetModuleFileNameA(h, path, MAX_PATH)) continue;
++            FILE* f = std::fopen(path, "rb");
++            if (!f) { log::info(str::format("Cubin twins: cannot open ", path)); continue; }
++            std::vector<uint8_t> file;
++            std::fseek(f, 0, SEEK_END); long len = std::ftell(f); std::fseek(f, 0, SEEK_SET);
++            if (len > 0) { file.resize(len); if (std::fread(file.data(), 1, len, f) != size_t(len)) file.clear(); }
++            std::fclose(f);
++            size_t found = 0;
++            for (size_t i = 0; i + 64 <= file.size(); i++) {
++                if (file[i] != 0x7f || std::memcmp(&file[i], "\x7f" "ELF", 4) != 0) continue;
++                elf::Cubin c;
++                if (elf::parse(file.data() + i, file.size() - i, c) && int(c.sm) == targetSm) { g_twins.push_back(std::move(c)); found++; }
++            }
++            log::info(str::format("Cubin twins: indexed ", found, " sm_", targetSm, " cubins from ", path));
++        }
++    }
++
++    static std::optional<std::vector<uint8_t>> SubstituteCubin(const void* data, uint32_t size) {
++        auto sm = retargetSm();
++        if (sm < 10 || sm > 99 || !data || size < 64) return std::nullopt;
++        elf::Cubin up;
++        if (!elf::parse(static_cast<const uint8_t*>(data), size, up)) return std::nullopt;
++        if (int(up.sm) <= sm) return std::nullopt;
++        loadTwins(sm);
++        std::scoped_lock lock(g_twinMutex);
++        const elf::Cubin* best = nullptr; double bestScore = -1; int strictCount = 0;
++        for (auto& t : g_twins) {
++            if (t.kernel != up.kernel) continue;
++            bool strict = t.textSize == up.textSize && t.c2 == up.c2 && t.c0Size == up.c0Size;
++            if (strict) strictCount++;
++            double s = elf::score(up, t) + (strict ? 1.0 : 0.0);
++            if (s > bestScore) { bestScore = s; best = &t; }
++        }
++        if (!best) {
++            log::info(str::format("Cubin substitute: no sm_", sm, " twin for '", up.kernel, "' (sm_", up.sm, ", size ", size, ")"));
++            return std::nullopt;
++        }
++        elf::Cubin twin = *best;
++        uint64_t shared = elf::sharedSize(up);
++        if (shared) elf::setSharedSize(twin, shared);
++        log::info(str::format("Cubin substitute: '", up.kernel, "' sm_", up.sm, " size ", size, " -> sm_", twin.sm, " twin size ", twin.data.size(), " (score ", bestScore, ", strict candidates ", strictCount, ", shared ", shared, ")"));
++        return twin.data;
++    }
++
++    static std::optional<std::vector<uint8_t>> RewriteCubin(const void* data, uint32_t size) {
++        if (auto r = NvapiD3d12Device::RetargetFatbin(data, size)) return r;
++        return SubstituteCubin(data, size);
++    }
++
+     HRESULT NvapiD3d12Device::CreateCubinComputeShaderWithName(const void* cubinData, NvU32 cubinSize, NvU32 blockX, NvU32 blockY, NvU32 blockZ, const char* shaderName, NVDX_ObjectHandle* pShader) {
+         return CreateCubinComputeShaderEx(cubinData, cubinSize, blockX, blockY, blockZ, 0 /* smemSize */, shaderName, pShader);
+     }
+@@ -119,9 +377,21 @@ namespace dxvk {
+         if (!m_vkd3dDevice || !m_supportsNvxBinaryImport)
+             return E_NOTIMPL;
+ 
++        dumpCubin(cubinData, cubinSize, shaderName);
++        auto retargeted = RewriteCubin(cubinData, cubinSize);
++        if (retargeted) {
++            cubinData = retargeted->data();
++            cubinSize = static_cast<NvU32>(retargeted->size());
++        }
++
+         auto result = m_vkd3dDevice->CreateCubinComputeShaderWithName(cubinData, cubinSize, blockX, blockY, blockZ, shaderName, reinterpret_cast<D3D12_CUBIN_DATA_HANDLE**>(pShader));
+-        if (FAILED(result))
++        if (FAILED(result)) {
++            log::info(str::format("CreateCubinComputeShaderEx failed hr=", log::fmt::hex(static_cast<uint32_t>(result)), " name=", shaderName ? shaderName : "(null)", " size=", cubinSize, " block=", blockX, "x", blockY, "x", blockZ, " smem=", smemSize, " retargeted=", retargeted ? 1 : 0));
+             return result;
++        }
++
++        if (retargeted)
++            KeepRetargeted(*pShader, std::move(*retargeted));
+ 
+         std::scoped_lock lock(m_cubinSmemMutex);
+         m_cubinSmemMap.emplace(*pShader, smemSize);
+@@ -137,6 +407,8 @@ namespace dxvk {
+         if (FAILED(result))
+             return result;
+ 
++        DropRetargeted(shader);
++
+         std::scoped_lock lock(m_cubinSmemMutex);
+         m_cubinSmemMap.erase(shader);
+ 
+@@ -172,9 +444,27 @@ namespace dxvk {
+         if (!m_supportsCubin64bit)
+             return E_NOTIMPL;
+ 
++        dumpCubin(params->pCubin, params->size, params->pShaderName);
++        auto retargeted = RewriteCubin(params->pCubin, params->size);
++        D3D12_CREATE_CUBIN_SHADER_PARAMS local{};
++        auto* callerParams = params;
++        if (retargeted) {
++            local = *params;
++            local.pCubin = retargeted->data();
++            local.size = static_cast<UINT32>(retargeted->size());
++            params = &local;
++        }
++
+         auto result = m_vkd3dDevice->CreateCubinComputeShaderExV2(params);
+-        if (FAILED(result))
++        if (retargeted)
++            callerParams->hShader = local.hShader;   // hand the created handle back to the caller
++        if (FAILED(result)) {
++            log::info(str::format("CreateCubinComputeShaderExV2 failed hr=", log::fmt::hex(static_cast<uint32_t>(result)), " name=", params->pShaderName ? params->pShaderName : "(null)", " size=", params->size, " block=", params->blockX, "x", params->blockY, "x", params->blockZ, " smem=", params->dynSharedMemBytes, " flags=", params->flags, " retargeted=", retargeted ? 1 : 0));
+             return result;
++        }
++
++        if (retargeted)
++            KeepRetargeted(reinterpret_cast<NVDX_ObjectHandle>(params->hShader), std::move(*retargeted));
+ 
+         std::scoped_lock lock(m_cubinSmemMutex);
+         m_cubinSmemMap.emplace(reinterpret_cast<NVDX_ObjectHandle>(params->hShader), params->dynSharedMemBytes);
+diff --git a/src/nvapi/nvapi_d3d12_device.h b/src/nvapi/nvapi_d3d12_device.h
+index 9c39782..b5711ae 100644
+--- a/src/nvapi/nvapi_d3d12_device.h
++++ b/src/nvapi/nvapi_d3d12_device.h
+@@ -2,12 +2,18 @@
+ 
+ #include "nvapi_adapter_registry.h"
+ #include "../nvapi_private.h"
++#include <optional>
++#include <vector>
+ #include "../interfaces/vkd3d-proton_interfaces.h"
+ 
+ namespace dxvk {
+     class NvapiD3d12Device final {
+ 
+       public:
++        // dlssg-open: retarget PTX inside CUDA fatbins to a lower SM (DXVK_NVAPI_CUBIN_RETARGET_SM)
++        [[nodiscard]] static std::optional<std::vector<uint8_t>> RetargetFatbin(const void* data, uint32_t size);
++        static void KeepRetargeted(NVDX_ObjectHandle handle, std::vector<uint8_t>&& buf);
++        static void DropRetargeted(NVDX_ObjectHandle handle);
+         static void Reset();
+         [[nodiscard]] static bool Cubin64bitSupportAvailable(NvapiResourceFactory* factory, NvapiAdapterRegistry* registry);
+         [[nodiscard]] static std::optional<NvapiD3d12Device> GetOrCreate(ID3D12Device* device);
+@@ -50,6 +56,8 @@ namespace dxvk {
+         LONGLONG m_creationTimestamp{};
+         ID3D12DeviceExt5* m_vkd3dDevice{};
+         bool m_supportsCubin64bit = false;
++
++
+         bool m_supportsNvShaderExtn = false;
+         bool m_supportsNvxBinaryImport = false;
+         bool m_supportsNvxImageViewHandle = false;
+diff --git a/src/util/util_env.cpp b/src/util/util_env.cpp
+index 59c8943..e022a90 100644
+--- a/src/util/util_env.cpp
++++ b/src/util/util_env.cpp
+@@ -209,6 +209,40 @@ namespace dxvk::env {
+         return false;
+     }
+ 
++
++    // dlssg-open: name of the module that contains pReturnAddress (lower-case basename), or "".
++    static std::string callerModuleName(void* pReturnAddress) {
++        char modulePath[MAX_PATH];
++        HMODULE hModule = nullptr;
++        if (!pReturnAddress || !GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<const char*>(pReturnAddress), &hModule))
++            return "";
++        uint32_t pathLen = GetModuleFileName(hModule, modulePath, MAX_PATH);
++        if (!pathLen) return "";
++        std::string p(modulePath, pathLen);
++        auto slash = p.find_last_of("\\/");
++        std::string base = slash == std::string::npos ? p : p.substr(slash + 1);
++        std::for_each(base.begin(), base.end(), [](char& ch) { ch = std::tolower(ch, std::locale::classic()); });
++        return base;
++    }
++
++    // dlssg-open: DXVK_NVAPI_GPU_ARCH_CALLERS="sl.dlss_g.dll,sl.common.dll" restricts DXVK_NVAPI_GPU_ARCH to
++    // those calling modules; every other caller sees the real architecture.
++    static bool archOverrideAppliesToCaller(void* pReturnAddress) {
++        static const std::string callers = [] {
++            auto v = env::getEnvVariable("DXVK_NVAPI_GPU_ARCH_CALLERS");
++            std::for_each(v.begin(), v.end(), [](char& ch) { ch = std::tolower(ch, std::locale::classic()); });
++            return v;
++        }();
++        auto name = callerModuleName(pReturnAddress);
++        if (callers.empty()) {
++            log::info(str::format("GetArchInfo caller: ", name.empty() ? "(unknown)" : name, " (override applies to all callers)"));
++            return true;
++        }
++        bool match = !name.empty() && (("," + callers + ",").find("," + name + ",") != std::string::npos);
++        log::info(str::format("GetArchInfo caller: ", name.empty() ? "(unknown)" : name, match ? " -> spoofed" : " -> real architecture"));
++        return match;
++    }
++
+     std::optional<NV_GPU_ARCHITECTURE_ID> getGpuArchitectureOverride() {
+         constexpr auto gpuArchEnvName = "DXVK_NVAPI_GPU_ARCH";
+         NV_GPU_ARCHITECTURE_ID override{};
+@@ -242,7 +276,7 @@ namespace dxvk::env {
+     }
+ 
+     std::optional<NV_GPU_ARCHITECTURE_ID> needsGpuArchitectureSpoofing(NV_GPU_ARCHITECTURE_ID architectureId, void* returnAddress) {
+-        if (auto override = getGpuArchitectureOverride(); override.has_value())
++        if (auto override = getGpuArchitectureOverride(); override.has_value() && archOverrideAppliesToCaller(returnAddress))
+             return override;
+ 
+         if (env::needsAmpereSpoofing(architectureId, returnAddress))

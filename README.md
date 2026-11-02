@@ -67,6 +67,31 @@ make -C nvcuda-lite          # nvcuda-lite/nvcuda.dll
 
 `tools/fatbin.py <dll> [outdir]` lists and extracts the CUDA fatbins in any file, with a lenient LZ4 decoder for NVIDIA's framing. Use it to check which PTX targets and instruction sets a runtime carries.
 
+## CUDA module API (for dlssg_for_sm86 0.4.x)
+
+The patch also implements NVAPI's CUDA module entry points on top of vkd3d-proton's cubin shaders:
+`NvAPI_D3D12_CreateCuModule`, `CreateCuFunction`, `LaunchCuKernelChain` (and `...Ex` with a packed
+parameter buffer), `DestroyCuModule`, `DestroyCuFunction`. Upstream dxvk-nvapi does not provide them.
+
+A module keeps a copy of its blob; each function is one vkd3d cubin shader created from that blob, so
+dumping, PTX retargeting and `sm_86` substitution apply unchanged. The block size is a launch parameter in
+this API, so it is written into the shader handle right before vkd3d records the launch. Null-pointer probes
+answer `NVAPI_INVALID_POINTER` like the Windows driver; the DLSS-G 310.9 runtime treats any other answer as
+"API missing" and falls back to the cubin path.
+
+[dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) 0.4.x substitutes its `sm_86` kernels only
+on this path. Without it, frame generation either fails at the first kernel (`Kernel_BlendCandidatesFused`,
+`CreateCubinComputeShaderExV2 hr=0x80004005`) or, with `DXVK_NVAPI_CUBIN_RETARGET_SM=86`, runs the stock
+kernels instead of the mod's. Tested 2026-11-02 on an RTX 3090 (driver 615.78) with dlssg_for_sm86 0.4.1
+in Monster Hunter Wilds and Crimson Desert: all kernels routed to the mod's `sm_86` cubins, no failed
+launches, 4X multi-frame generation.
+
+Launch options with dlssg_for_sm86 (no architecture spoof, the mod handles that):
+
+```
+NVCUDA_LITE_CC=8.6 DXVK_NVAPI_CUBIN_RETARGET_SM=86 PROTON_ENABLE_NVAPI=1 %command%
+```
+
 ## Known issues
 
 - Menu depth-of-field flicker in Ghost of Tsushima. The same artefact is reported on Ada under Windows.

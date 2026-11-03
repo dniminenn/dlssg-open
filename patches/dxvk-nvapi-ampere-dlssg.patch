@@ -1,5 +1,5 @@
 diff --git a/src/nvapi/nvapi_d3d12_device.cpp b/src/nvapi/nvapi_d3d12_device.cpp
-index 761590e..5bf4126 100644
+index 761590e..31e5ec3 100644
 --- a/src/nvapi/nvapi_d3d12_device.cpp
 +++ b/src/nvapi/nvapi_d3d12_device.cpp
 @@ -1,5 +1,15 @@
@@ -366,6 +366,218 @@ index 9c39782..b5711ae 100644
          bool m_supportsNvShaderExtn = false;
          bool m_supportsNvxBinaryImport = false;
          bool m_supportsNvxImageViewHandle = false;
+diff --git a/src/nvapi/nvapi_d3d12_graphics_command_list.cpp b/src/nvapi/nvapi_d3d12_graphics_command_list.cpp
+index b8ec06a..aaee745 100644
+--- a/src/nvapi/nvapi_d3d12_graphics_command_list.cpp
++++ b/src/nvapi/nvapi_d3d12_graphics_command_list.cpp
+@@ -82,6 +82,33 @@ namespace dxvk {
+         return m_vkd3dGraphicsCommandList->LaunchCubinShader(reinterpret_cast<D3D12_CUBIN_DATA_HANDLE*>(pShader), blockX, blockY, blockZ, params, paramSize);
+     }
+ 
++    // dlssg-open: CU-module launch (NvAPI_D3D12_LaunchCuKernelChain) on top of vkd3d's cubin launch.
++    // vkd3d records vkCmdCuLaunchKernelNVX immediately and reads the block size from the handle, so the
++    // per-launch block size is written into the handle under a lock right before recording.
++    // ponytail: one global lock for all CU launches; per-function handles per block size if it ever contends.
++    HRESULT NvapiD3d12GraphicsCommandList::LaunchCuKernel(const NVAPI_CU_KERNEL_LAUNCH_PARAMS& k) const {
++        if (!m_vkd3dGraphicsCommandList)
++            return E_NOTIMPL;
++
++        auto handle = reinterpret_cast<D3D12_CUBIN_DATA_HANDLE*>(k.hFunction);
++        if (!handle)
++            return E_INVALIDARG;
++
++        if (!m_supportsCubinSMem && k.dynSharedMemBytes != 0)
++            return E_NOTIMPL;
++
++        static std::mutex launchMutex;
++        std::scoped_lock lock(launchMutex);
++        handle->blockX = k.blockDim.x;
++        handle->blockY = k.blockDim.y;
++        handle->blockZ = k.blockDim.z;
++
++        if (m_supportsCubinSMem)
++            return m_vkd3dGraphicsCommandList->LaunchCubinShaderEx(handle, k.gridDim.x, k.gridDim.y, k.gridDim.z, k.dynSharedMemBytes, k.pParams, k.paramSize, nullptr, 0);
++
++        return m_vkd3dGraphicsCommandList->LaunchCubinShader(handle, k.gridDim.x, k.gridDim.y, k.gridDim.z, k.pParams, k.paramSize);
++    }
++
+     bool NvapiD3d12GraphicsCommandList::VerifyOpacityMicromapArrayNVAPI(D3D12_GPU_VIRTUAL_ADDRESS opacity_micromap_array) const {
+         return m_supportsOpacityMicromap && m_vkd3dGraphicsCommandList->VerifyOpacityMicromapArrayNVAPI(opacity_micromap_array);
+     }
+diff --git a/src/nvapi/nvapi_d3d12_graphics_command_list.h b/src/nvapi/nvapi_d3d12_graphics_command_list.h
+index 49cdaa1..d9db360 100644
+--- a/src/nvapi/nvapi_d3d12_graphics_command_list.h
++++ b/src/nvapi/nvapi_d3d12_graphics_command_list.h
+@@ -14,6 +14,7 @@ namespace dxvk {
+         explicit NvapiD3d12GraphicsCommandList(ID3D12GraphicsCommandListExt* vkd3dCommandList);
+ 
+         [[nodiscard]] HRESULT LaunchCubinShader(NVDX_ObjectHandle shader, NvU32 blockX, NvU32 blockY, NvU32 blockZ, const void* params, NvU32 paramSize) const;
++        [[nodiscard]] HRESULT LaunchCuKernel(const NVAPI_CU_KERNEL_LAUNCH_PARAMS& kernel) const;
+         [[nodiscard]] bool IsOpacityMicromapSupported() const { return m_supportsOpacityMicromap; }
+ 
+         NvapiAsConverter& GetAsConverter() { return m_asConverter; }
+diff --git a/src/nvapi_d3d12.cpp b/src/nvapi_d3d12.cpp
+index b4c01ae..f9de1b8 100644
+--- a/src/nvapi_d3d12.cpp
++++ b/src/nvapi_d3d12.cpp
+@@ -1173,3 +1173,140 @@ NVAPI_FUNCTION NvAPI_D3D12_SetAsyncFrameMarker(ID3D12CommandQueue* pCommandQueue
+             return Error(n, alreadyLoggedError);
+     }
+ }
++
++// dlssg-open: CUDA-module API (CreateCuModule / CreateCuFunction / LaunchCuKernelChain) mapped onto vkd3d's
++// cubin shaders. A module only keeps a copy of its blob; each function is one vkd3d cubin shader created
++// from that blob (so dumping, PTX retargeting and sm_86 substitution of the cubin path apply unchanged).
++namespace {
++    struct CuModule {
++        std::vector<uint8_t> blob;
++    };
++}
++
++NVAPI_FUNCTION NvAPI_D3D12_CreateCuModule(ID3D12Device* pDevice, const void* pBlob, NvU32 size, NVDX_ObjectHandle* phModule) {
++    static constexpr auto n = FUNC;
++    thread_local bool alreadyLoggedNoImplementation = false;
++    thread_local bool alreadyLoggedOk = false;
++
++    if (log::tracing())
++        log::trace(n, log::fmt::ptr(pDevice), log::fmt::ptr(pBlob), size, log::fmt::ptr(phModule));
++
++    // The runtime probes with null pointers and takes the driver's INVALID_POINTER as "API present",
++    // so report NO_IMPLEMENTATION first where vkd3d-proton cannot create cubin shaders.
++    if (!NvapiD3d12Device::Cubin64bitSupportAvailable(resourceFactory.get(), nvapiAdapterRegistry.get()))
++        return NoImplementation(n, alreadyLoggedNoImplementation);
++
++    if (!pBlob || !phModule)
++        return InvalidPointer(n);
++
++    if (!pDevice || !size)
++        return InvalidArgument(n);
++
++    if (!NvapiD3d12Device::GetOrCreate(pDevice))
++        return NoImplementation(n, alreadyLoggedNoImplementation);
++
++    auto bytes = static_cast<const uint8_t*>(pBlob);
++    auto module = new CuModule{std::vector<uint8_t>(bytes, bytes + size)};
++    *phModule = reinterpret_cast<NVDX_ObjectHandle>(module);
++    return Ok(n, alreadyLoggedOk);
++}
++
++NVAPI_FUNCTION NvAPI_D3D12_CreateCuFunction(ID3D12Device* pDevice, NVDX_ObjectHandle hModule, const char* pName, NVDX_ObjectHandle* phFunction) {
++    static constexpr auto n = FUNC;
++    thread_local bool alreadyLoggedNoImplementation = false;
++    thread_local bool alreadyLoggedError = false;
++    thread_local bool alreadyLoggedOk = false;
++
++    if (log::tracing())
++        log::trace(n, log::fmt::ptr(pDevice), log::fmt::hnd(hModule), pName ? pName : "(null)", log::fmt::ptr(phFunction));
++
++    if (!pName || !phFunction)
++        return InvalidPointer(n);
++
++    if (!pDevice || !hModule)
++        return InvalidArgument(n);
++
++    auto device = NvapiD3d12Device::GetOrCreate(pDevice);
++    if (!device)
++        return NoImplementation(n, alreadyLoggedNoImplementation);
++
++    auto module = reinterpret_cast<CuModule*>(hModule);
++    // Block size is a launch parameter in the CU API; LaunchCuKernelChain writes it into the handle.
++    switch (device->CreateCubinComputeShaderEx(module->blob.data(), static_cast<NvU32>(module->blob.size()), 1, 1, 1, 0, pName, phFunction)) {
++        case S_OK:
++            return Ok(n, alreadyLoggedOk);
++        case E_NOTIMPL:
++            return NoImplementation(n, alreadyLoggedNoImplementation);
++        default:
++            return Error(n, alreadyLoggedError);
++    }
++}
++
++NVAPI_FUNCTION NvAPI_D3D12_LaunchCuKernelChain(ID3D12GraphicsCommandList* pCommandList, const NVAPI_CU_KERNEL_LAUNCH_PARAMS* pKernels, NvU32 numKernels) {
++    static constexpr auto n = FUNC;
++    thread_local bool alreadyLoggedNoImplementation = false;
++    thread_local bool alreadyLoggedError = false;
++    thread_local bool alreadyLoggedOk = false;
++
++    if (log::tracing())
++        log::trace(n, log::fmt::ptr(pCommandList), log::fmt::ptr(pKernels), numKernels);
++
++    if (!NvapiD3d12Device::Cubin64bitSupportAvailable(resourceFactory.get(), nvapiAdapterRegistry.get()))
++        return NoImplementation(n, alreadyLoggedNoImplementation);
++
++    if (!pKernels || !numKernels)   // capability probe; the real driver answers -14 (INVALID_POINTER) here
++        return InvalidPointer(n);
++
++    if (!pCommandList)
++        return InvalidArgument(n);
++
++    auto commandList = NvapiD3d12GraphicsCommandList::GetOrCreate(pCommandList);
++    if (!commandList)
++        return NoImplementation(n, alreadyLoggedNoImplementation);
++
++    for (NvU32 i = 0; i < numKernels; i++) {
++        switch (commandList->LaunchCuKernel(pKernels[i])) {
++            case S_OK:
++                break;
++            case E_NOTIMPL:
++                return NoImplementation(n, alreadyLoggedNoImplementation);
++            default:
++                return Error(n, alreadyLoggedError);
++        }
++    }
++
++    return Ok(n, alreadyLoggedOk);
++}
++
++NVAPI_FUNCTION NvAPI_D3D12_LaunchCuKernelChainEx(ID3D12GraphicsCommandList* pCommandList, const NVAPI_CU_KERNEL_LAUNCH_PARAMS_EX* pKernels, NvU32 numKernels) {
++    static constexpr auto n = FUNC;
++    thread_local bool alreadyLoggedNoImplementation = false;
++
++    if (!pCommandList || (!pKernels && numKernels))
++        return InvalidArgument(n);
++
++    // Only the packed-buffer form; kernelParams carries no count, so it cannot be forwarded.
++    std::vector<NVAPI_CU_KERNEL_LAUNCH_PARAMS> kernels(numKernels);
++    for (NvU32 i = 0; i < numKernels; i++) {
++        if (pKernels[i].kernelParams)
++            return NoImplementation(n, alreadyLoggedNoImplementation);
++        kernels[i] = {pKernels[i].hFunction, pKernels[i].gridDim, pKernels[i].blockDim, pKernels[i].dynSharedMemBytes, pKernels[i].pParams, pKernels[i].paramSize};
++    }
++
++    return NvAPI_D3D12_LaunchCuKernelChain(pCommandList, kernels.data(), numKernels);
++}
++
++NVAPI_FUNCTION NvAPI_D3D12_DestroyCuModule(ID3D12Device* pDevice, NVDX_ObjectHandle hModule) {
++    static constexpr auto n = FUNC;
++    thread_local bool alreadyLoggedOk = false;
++
++    if (!pDevice || !hModule)
++        return InvalidArgument(n);
++
++    delete reinterpret_cast<CuModule*>(hModule);
++    return Ok(n, alreadyLoggedOk);
++}
++
++NVAPI_FUNCTION NvAPI_D3D12_DestroyCuFunction(ID3D12Device* pDevice, NVDX_ObjectHandle hFunction) {
++    return NvAPI_D3D12_DestroyCubinComputeShader(pDevice, hFunction);
++}
+diff --git a/src/nvapi_interface.cpp b/src/nvapi_interface.cpp
+index 3e45558..c91ad1c 100644
+--- a/src/nvapi_interface.cpp
++++ b/src/nvapi_interface.cpp
+@@ -116,6 +116,12 @@ NVAPI_QUERY_INTERFACE nvapi_QueryInterface(NvU32 id) {
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_GetCudaMergedTextureSamplerObject)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_GetCudaIndependentDescriptorObject)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_LaunchCubinShader)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_CreateCuModule)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_CreateCuFunction)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_LaunchCuKernelChain)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_LaunchCuKernelChainEx)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_DestroyCuModule)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_DestroyCuFunction)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_CaptureUAVInfo)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_GetGraphicsCapabilities)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_D3D12_IsFatbinPTXSupported)
 diff --git a/src/util/util_env.cpp b/src/util/util_env.cpp
 index 59c8943..e022a90 100644
 --- a/src/util/util_env.cpp
